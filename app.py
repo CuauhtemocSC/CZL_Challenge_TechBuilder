@@ -1,97 +1,112 @@
 import os
+import io
 import streamlit as st
+from docx import Document
+from PIL import Image
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document as LCDocument
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.llms import HuggingFacePipeline
-from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
+from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer, BlipProcessor, BlipForConditionalGeneration
 
-# Configuración de la página web
-st.set_page_config(page_title="Asistente Operativo IA", page_icon="🤖", layout="centered")
+st.set_page_config(page_title="Asistente Operativo Multimodal", page_icon="🤖", layout="centered")
 
-# Usamos la caché de Streamlit para cargar el modelo e índices una sola vez y ahorrar memoria
+# --- PROCESAMIENTO AUTOMÁTICO EN LA NUBE ---
 @st.cache_resource
-def cargar_agente():
-    ruta_db = "./vector_db"
+def procesar_e_inicializar_todo():
+    carpeta_docs = "./documentos"
+    ruta_db = "./vector_db_cloud"
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     
+    # Si la base de datos no existe en la nube, procesamos los Word en el arranque
     if not os.path.exists(ruta_db):
-        return None
+        st.info("📦 Inicializando el cerebro del agente por primera vez en la nube...")
         
-    vector_store = Chroma(persist_directory=ruta_db, embedding_function=embeddings)
+        # Cargar modelo visual para las imágenes
+        processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        model_v = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+        
+        documentos_para_vectorizar = []
+        if os.path.exists(carpeta_docs):
+            for archivo in os.listdir(carpeta_docs):
+                if archivo.endswith(".docx"):
+                    doc = Document(os.path.join(carpeta_docs, archivo))
+                    texto_acumulado = []
+                    for para in doc.paragraphs:
+                        texto_acumulado.append(para.text)
+                        if 'graphic' in para._p.xml:
+                            for rel_id, rel in doc.part.rels.items():
+                                if "image" in rel.target_ref:
+                                    try:
+                                        img_bytes = rel.target_part.blob
+                                        imagen = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+                                        inputs = processor(imagen, text="A diagram showing", return_tensors="pt")
+                                        out = model_v.generate(**inputs)
+                                        desc = processor.decode(out[0], skip_special_tokens=True)
+                                        texto_acumulado.append(f"\n[IMAGEN: {desc}]\n")
+                                    except: pass
+                    
+                    documentos_para_vectorizar.append(
+                        LCDocument(page_content="\n".join(texto_acumulado), metadata={"source": archivo})
+                    )
+        
+        if documentos_para_vectorizar:
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            fragmentos = text_splitter.split_documents(documentos_para_vectorizar)
+            vector_store = Chroma.from_documents(documents=fragmentos, embedding=embeddings, persist_directory=ruta_db)
+        else:
+            # Si no hay documentos, creamos una BD vacía para evitar errores
+            vector_store = Chroma.from_documents(documents=[LCDocument(page_content="No hay datos.")], embedding=embeddings, persist_directory=ruta_db)
+    else:
+        vector_store = Chroma(persist_directory=ruta_db, embedding_function=embeddings)
+        
     retriever = vector_store.as_retriever(search_kwargs={"k": 3})
 
-    # Modelo ultra-ligero ideal para correr localmente
+    # Cargar LLM
     model_id = "Qwen/Qwen2.5-0.5B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id)
+    model_llm = AutoModelForCausalLM.from_pretrained(model_id)
     
-    pipe = pipeline(
-        "text-generation", 
-        model=model, 
-        tokenizer=tokenizer, 
-        max_new_tokens=256, 
-        temperature=0.2
-    )
+    pipe = pipeline("text-generation", model=model_llm, tokenizer=tokenizer, max_new_tokens=256, temperature=0.2)
     llm = HuggingFacePipeline(pipeline=pipe)
 
     system_prompt = (
-        "Eres un asistente operativo experto. Responde la pregunta del usuario "
-        "basándote ÚNICAMENTE en el contexto provisto. Si no sabes la respuesta o no está "
-        "en el contexto, di amablemente que no tienes esa información en los manuales.\n\n"
-        "Contexto:\n{context}\n\n"
-        "Pregunta: {input}\n"
-        "Respuesta:"
+        "Eres un asistente operativo experto. Responde en español basándote ÚNICAMENTE en el contexto provisto. "
+        "Si la información no está en el contexto, di amablemente que no la encuentras en los manuales.\n\n"
+        "Contexto:\n{context}\n\nPregunta: {input}\nRespuesta:"
     )
-    
     prompt = ChatPromptTemplate.from_template(system_prompt)
-
+    
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
 
-    rag_chain = (
+    return (
         {"context": retriever | format_docs, "input": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
+        | prompt | llm | StrOutputParser()
     )
-    return rag_chain
 
-# --- INTERFAZ DE USUARIO ---
-st.title("🤖 Asistente de Guías Operativas")
-st.subheader("Consulta tus manuales y resuelve dudas en segundos")
+# --- INTERFAZ ---
+st.title("🤖 Asistente Operativo Corporativo")
 st.markdown("---")
 
-# Inicializar el agente RAG
-with st.spinner("Cargando el motor de IA y base de datos..."):
-    agente = cargar_agente()
+agente = procesar_e_inicializar_todo()
 
-if agente is None:
-    st.error("❌ No se encontró la base de datos vectorial en `./vector_db`. Por favor, ejecuta primero `python ingestar.py` en tu terminal.")
-else:
-    # Inicializar el historial de chat en la sesión si no existe
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {"role": "assistant", "content": "¡Hola! He leído tus guías operativas. ¿En qué proceso te puedo ayudar hoy?"}
-        ]
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "assistant", "content": "¡Hola! He procesado las guías operativas. ¿Qué duda deseas resolver?"}]
 
-    # Mostrar los mensajes anteriores del chat
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]): st.write(message["content"])
 
-    # Capturar la entrada del usuario
-    if pregunta_usuario := st.chat_input("Escribe tu duda sobre los manuales aquí..."):
-        # Mostrar mensaje del usuario
-        with st.chat_message("user"):
-            st.write(pregunta_usuario)
-        st.session_state.messages.append({"role": "user", "content": pregunta_usuario})
+if pregunta_usuario := st.chat_input("Escribe tu duda aquí..."):
+    with st.chat_message("user"): st.write(pregunta_usuario)
+    st.session_state.messages.append({"role": "user", "content": pregunta_usuario})
 
-        # Generar respuesta del agente
-        with st.chat_message("assistant"):
-            with st.spinner("Buscando en manuales..."):
-                respuesta_completa = agente.invoke(pregunta_usuario)
-                st.write(respuesta_completa)
-        st.session_state.messages.append({"role": "assistant", "content": respuesta_completa})
+    with st.chat_message("assistant"):
+        with st.spinner("Analizando manuales..."):
+            respuesta = agente.invoke(pregunta_usuario)
+            st.write(respuesta)
+    st.session_state.messages.append({"role": "assistant", "content": respuesta})
